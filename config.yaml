@@ -1,0 +1,52 @@
+# customer-churn-ltv-engine/config.yaml
+
+# Data Paths
+data:
+  raw_path: "data/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv"
+  processed_path: "data/processed/telco_churn_processed.csv"
+  target_col_churn: "Churn"
+  target_col_ltv: "TotalCharges"
+
+# Features configuration
+features:
+  categorical:
+    - "gender"
+    - "SeniorCitizen"
+    - "Partner"
+    - "Dependents"
+    - "PhoneService"
+    - "MultipleLines"
+    - "InternetService"
+    - "OnlineSecurity"
+    - "OnlineBackup"
+    - "DeviceProtection"
+    - "TechSupport"
+    - "StreamingTV"
+    - "StreamingMovies"
+    - "Contract"
+    - "PaperlessBilling"
+    - "PaymentMethod"
+  numerical:
+    - "tenure"
+    - "MonthlyCharges"
+    - "TotalCharges"
+
+# Model hyperparameters & settings
+model:
+  churn:
+    model_type: "random_forest"
+    n_estimators: 100
+    max_depth: 6
+    random_state: 42
+    test_size: 0.2
+  ltv:
+    model_type: "ridge"
+    alpha: 1.0
+    random_state: 42
+    test_size: 0.2
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  log_file: "reports/engine.log"
