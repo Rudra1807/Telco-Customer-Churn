@@ -2,7 +2,8 @@
 import os
 import joblib
 import pandas as pd
-from src.utils import get_logger, load_config
+from sklearn.pipeline import Pipeline
+from src.utils import get_logger, load_config, PROJECT_ROOT
 from src.preprocessing import clean_data
 from src.feature_engineering import create_features
 
@@ -10,92 +11,122 @@ from src.feature_engineering import create_features
 config = load_config()
 logger = get_logger(__name__, config)
 
-class ChurnLTVInferencePipeline:
-    def __init__(self, model_dir="models/"):
-        """
-        Loads pre-trained model and preprocessing pipeline artifacts.
-        """
-        self.model_dir = model_dir
-        self.model_path = os.path.join(model_dir, "churn_model.joblib")
-        self.preprocessor_path = os.path.join(model_dir, "preprocessor.joblib")
-        
-        self.model = None
-        self.preprocessor = None
-        
-        # Check if one level up (if running from subdirectories)
-        if not os.path.exists(self.model_path):
-            self.model_path = os.path.join("..", self.model_path)
-            self.preprocessor_path = os.path.join("..", self.preprocessor_path)
 
-    def load_artifacts(self):
+class ChurnLTVInferencePipeline:
+    """
+    Inference pipeline for churn probability scoring and LTV prediction.
+
+    Loads the unified sklearn Pipeline artifact produced by train.train_churn_pipeline()
+    (a single .joblib file containing both the ColumnTransformer preprocessor and the
+    classifier).  Exposes a clean predict_churn() interface that accepts either a
+    single customer dict or a batch pd.DataFrame.
+
+    Usage:
+        pipeline = ChurnLTVInferencePipeline()
+        pipeline.load_artifacts()
+        results = pipeline.predict_churn({"customerID": "X", "tenure": 12, ...})
+    """
+
+    def __init__(self, model_dir: str = "models/"):
         """
-        Loads joblib serialized preprocessor pipeline and model files.
+        Parameters:
+            model_dir (str): Directory containing 'churn_model.joblib'.
+                Relative paths are resolved against the project root.
         """
-        if os.path.exists(self.model_path) and os.path.exists(self.preprocessor_path):
-            logger.info(f"Loading inference model artifact from: {self.model_path}")
-            self.model = joblib.load(self.model_path)
-            logger.info(f"Loading preprocessor artifact from: {self.preprocessor_path}")
-            self.preprocessor = joblib.load(self.preprocessor_path)
+        # Always resolve to an absolute path so the class works from any CWD
+        if not os.path.isabs(model_dir):
+            model_dir = os.path.join(PROJECT_ROOT, model_dir)
+
+        self.model_dir = model_dir
+        # Single unified Pipeline artifact (preprocessor + classifier combined)
+        self.model_path = os.path.join(model_dir, "churn_model.joblib")
+
+        self.pipeline: Pipeline | None = None
+
+    def load_artifacts(self) -> None:
+        """
+        Loads the unified churn Pipeline artifact from disk.
+
+        The artifact is a single sklearn Pipeline (produced by
+        train.train_churn_pipeline) containing both the ColumnTransformer
+        preprocessor and the classifier.  If the file is not found the
+        pipeline continues in mock-scoring mode.
+        """
+        if os.path.exists(self.model_path):
+            logger.info(f"Loading unified churn pipeline from: {self.model_path}")
+            self.pipeline = joblib.load(self.model_path)
+            logger.info("Churn pipeline artifact loaded successfully.")
         else:
             logger.warning(
-                f"Artifacts not found at '{self.model_path}'. "
-                "Inference will rely on dummy outputs until model training is executed."
+                f"Artifact not found at '{self.model_path}'. "
+                "Inference will return mock scores until the model is trained."
             )
 
-    def predict_churn(self, raw_data):
+    def predict_churn(self, raw_data) -> list[dict]:
         """
-        Transforms raw data and makes predictions.
-        
+        Scores one or more customer records for churn probability.
+
+        Applies the same clean_data → create_features → transform → predict
+        chain used during training, guaranteeing train/serve consistency.
+
         Parameters:
-            raw_data (pd.DataFrame or dict): Input subscriber profile data.
-            
+            raw_data (dict | pd.DataFrame): A single customer profile dict or
+                a DataFrame of customer records.
+
         Returns:
-            dict: Churn predictions containing probabilities and classification labels.
+            list[dict]: One result dict per input record, each containing:
+                - customerID (str)
+                - churn_probability (float)
+                - churn_prediction (int, 0 or 1)
         """
         if isinstance(raw_data, dict):
             df = pd.DataFrame([raw_data])
-        else:
+        elif isinstance(raw_data, pd.DataFrame):
             df = raw_data.copy()
-            
-        logger.info(f"Received inference request for {len(df)} records.")
-        
-        # 1. Clean and engineer features
+        else:
+            raise TypeError(
+                f"raw_data must be a dict or pd.DataFrame, got {type(raw_data).__name__}."
+            )
+
+        logger.info(f"Received inference request — {len(df)} record(s).")
+
+        # ── Pre-processing ─────────────────────────────────────────────────────
         df_cleaned = clean_data(df)
         df_features = create_features(df_cleaned)
-        
-        # 2. Check if artifacts are loaded
-        if self.model is None or self.preprocessor is None:
-            logger.info("Serving mock inference scores (no trained artifacts loaded)...")
-            # Mock scoring
+
+        # ── Scoring ───────────────────────────────────────────────────────────
+        if self.pipeline is None:
+            logger.info("Mock scoring mode — no trained pipeline artifact loaded.")
             probabilities = [0.15] * len(df)
             predictions = [0] * len(df)
         else:
-            # Drop unnecessary columns that are not features
-            X = df_features.drop(columns=['customerID', 'Churn'], errors='ignore')
-            # Transform
-            X_trans = self.preprocessor.transform(X)
-            # Predict
-            probabilities = self.model.predict_proba(X_trans)[:, 1].tolist()
-            predictions = self.model.predict(X_trans).tolist()
-            
+            # The unified Pipeline handles both transform and predict internally.
+            # No separate .transform() call is needed or correct here.
+            X = df_features.drop(columns=["customerID", "Churn"], errors="ignore")
+            probabilities = self.pipeline.predict_proba(X)[:, 1].tolist()
+            predictions = self.pipeline.predict(X).tolist()
+
+        # ── Build result list ─────────────────────────────────────────────────
+        # FIX: use enumerate() for the list index — df.iterrows() yields the
+        # DataFrame's .index values (could be non-zero-based after slicing),
+        # which must NOT be used to index into the plain Python lists above.
         results = []
-        for idx, row in df.iterrows():
-            cust_id = row.get('customerID', f"TEMP_{idx}")
+        for list_pos, (df_idx, row) in enumerate(df.iterrows()):
+            cust_id = row.get("customerID", f"TEMP_{df_idx}")
             results.append({
                 "customerID": cust_id,
-                "churn_probability": probabilities[idx],
-                "churn_prediction": int(predictions[idx])
+                "churn_probability": round(probabilities[list_pos], 4),
+                "churn_prediction": int(predictions[list_pos]),
             })
-            
-        logger.info("Inference calculations completed successfully.")
+
+        logger.info(f"Inference complete — {len(results)} result(s) returned.")
         return results
 
+
 if __name__ == "__main__":
-    # Test script execution
     pipeline = ChurnLTVInferencePipeline()
     pipeline.load_artifacts()
-    
-    # Sample customer payload
+
     sample_payload = {
         "customerID": "0000-TEST",
         "gender": "Female",
@@ -116,9 +147,10 @@ if __name__ == "__main__":
         "PaperlessBilling": "Yes",
         "PaymentMethod": "Electronic check",
         "MonthlyCharges": 55.85,
-        "TotalCharges": "670.20"
+        "TotalCharges": "670.20",
     }
-    
-    predictions = pipeline.predict_churn(sample_payload)
-    print("Sample Inference Prediction Result:")
-    print(predictions)
+
+    results = pipeline.predict_churn(sample_payload)
+    print("Sample Inference Result:")
+    for r in results:
+        print(r)

@@ -3,77 +3,93 @@ import os
 import logging
 import yaml
 
-def load_config(config_path="config.yaml"):
+# Resolve project root relative to this file's location (src/ → project root)
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(_SRC_DIR)
+
+
+def load_config(config_path: str = "config.yaml") -> dict:
     """
     Loads project configurations from a YAML file.
-    
+
+    Resolves paths relative to the project root so the config can be loaded
+    correctly regardless of the current working directory.
+
     Parameters:
         config_path (str): Path to the YAML configuration file.
-        
+            Accepts an absolute path or a path relative to the project root.
+
     Returns:
         dict: Parsed configurations.
+
+    Raises:
+        FileNotFoundError: If the config file cannot be located.
     """
-    # Handle absolute/relative path resolving if needed
-    if not os.path.exists(config_path):
-        # Check if one level up (if running from notebooks/ or src/)
-        parent_config = os.path.join("..", config_path)
-        if os.path.exists(parent_config):
-            config_path = parent_config
-        else:
-            raise FileNotFoundError(f"Configuration file not found at '{config_path}' or '{parent_config}'.")
-            
-    with open(config_path, 'r') as file:
-        config = yaml.safe_load(file)
+    # If not absolute, resolve relative to the project root
+    if not os.path.isabs(config_path):
+        resolved = os.path.join(PROJECT_ROOT, config_path)
+    else:
+        resolved = config_path
+
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(
+            f"Configuration file not found at '{resolved}'. "
+            "Ensure 'config.yaml' exists at the project root."
+        )
+
+    with open(resolved, "r", encoding="utf-8") as fh:
+        config = yaml.safe_load(fh)
     return config
 
-def get_logger(name, config=None):
+
+def get_logger(name: str, config: dict = None) -> logging.Logger:
     """
-    Configures and returns a professional logger.
-    
+    Configures and returns a structured logger with console and file handlers.
+
     Parameters:
-        name (str): Name of the logger.
-        config (dict, optional): Logger configurations dict loaded from load_config().
-        
+        name (str): Logger name (typically __name__ of the calling module).
+        config (dict, optional): Parsed config dict from load_config().
+
     Returns:
-        logging.Logger: Pre-configured logger object.
+        logging.Logger: Configured logger instance.
     """
     logger = logging.getLogger(name)
-    
-    # If logger already has handlers, don't duplicate them
+
+    # Avoid adding duplicate handlers on repeated imports
     if logger.handlers:
         return logger
-        
-    logger.setLevel(logging.INFO)
-    
-    # Defaults if config is missing
+
+    # Defaults
     log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    log_file = "reports/engine.log"
-    
-    if config and 'logging' in config:
-        log_cfg = config['logging']
-        log_format = log_cfg.get('format', log_format)
-        log_file = log_cfg.get('log_file', log_file)
-        level_str = log_cfg.get('level', 'INFO')
-        logger.setLevel(getattr(logging, level_str.upper(), logging.INFO))
-        
-    # Ensure log file directory exists
-    log_dir = os.path.dirname(log_file)
-    if log_dir and not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
-        
+    log_file = os.path.join(PROJECT_ROOT, "reports", "engine.log")
+    log_level = logging.INFO
+
+    if config and "logging" in config:
+        log_cfg = config["logging"]
+        log_format = log_cfg.get("format", log_format)
+        raw_file = log_cfg.get("log_file", "reports/engine.log")
+        # Resolve log file path relative to project root
+        log_file = os.path.join(PROJECT_ROOT, raw_file) if not os.path.isabs(raw_file) else raw_file
+        log_level = getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO)
+
+    logger.setLevel(log_level)
+
+    # Ensure the log directory exists
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
     formatter = logging.Formatter(log_format)
-    
-    # Console Handler
+
+    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-    
-    # File Handler
+
+    # File handler
     try:
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-    except Exception as e:
-        print(f"Warning: Could not create log file handler for '{log_file}': {e}")
-        
+    except OSError as exc:
+        logger.warning(f"Could not create log file handler for '{log_file}': {exc}")
+
     return logger
