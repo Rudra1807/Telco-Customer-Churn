@@ -1,18 +1,11 @@
 # src/train.py
 import os
 import joblib
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import (
-    accuracy_score,
-    roc_auc_score,
-    classification_report,
-    confusion_matrix,
-)
+import xgboost as xgb
+from xgboost import XGBClassifier, XGBRegressor
 
 from src.utils import get_logger, load_config, PROJECT_ROOT
-from src.preprocessing import get_preprocessor_pipeline
+from src.preprocessing import preprocess_dataframe
 
 # Initialize configuration and logger
 config = load_config()
@@ -21,54 +14,48 @@ logger = get_logger(__name__, config)
 
 # ── Model factory ──────────────────────────────────────────────────────────────
 
-def get_churn_model(model_type: str, model_params: dict):
+def get_churn_model(model_params: dict) -> XGBClassifier:
     """
-    Instantiates a churn classification model based on the config selection.
-
-    class_weight='balanced' is applied to both classifiers to compensate for
-    the ~26 % churn-class imbalance in the Telco dataset.
+    Instantiates an XGBoost churn classifier with the given parameters.
 
     Parameters:
-        model_type (str): One of 'random_forest' or 'logistic_regression'.
         model_params (dict): Hyperparameter dict sourced from config.yaml.
 
     Returns:
-        sklearn estimator: Unfitted classifier.
+        XGBClassifier: Unfitted XGBoost classifier.
     """
-    if model_type == "random_forest":
-        return RandomForestClassifier(
-            n_estimators=model_params.get("n_estimators", 100),
-            max_depth=model_params.get("max_depth", 6),
-            random_state=model_params.get("random_state", 42),
-            class_weight="balanced",    # handles class imbalance
-            n_jobs=-1,                  # use all CPU cores
-        )
-    elif model_type == "logistic_regression":
-        return LogisticRegression(
-            max_iter=1000,
-            class_weight="balanced",
-            random_state=model_params.get("random_state", 42),
-        )
-    else:
-        logger.warning(
-            f"Unknown model type '{model_type}'. Defaulting to LogisticRegression."
-        )
-        return LogisticRegression(max_iter=1000, class_weight="balanced")
+    return XGBClassifier(
+        n_estimators     = model_params.get("n_estimators", 100),
+        max_depth        = model_params.get("max_depth", 6),
+        learning_rate    = model_params.get("learning_rate", 0.1),
+        subsample        = model_params.get("subsample", 0.8),
+        colsample_bytree = model_params.get("colsample_bytree", 0.8),
+        use_label_encoder= False,
+        eval_metric      = "logloss",
+        random_state     = model_params.get("random_state", 42),
+        n_jobs           = -1,
+    )
 
 
-def get_ltv_model(model_params: dict):
+def get_ltv_model(model_params: dict) -> XGBRegressor:
     """
-    Instantiates a Ridge regression model for LTV (TotalCharges) prediction.
+    Instantiates an XGBoost regressor for LTV (TotalCharges) prediction.
 
     Parameters:
         model_params (dict): Hyperparameter dict from config['model']['ltv'].
 
     Returns:
-        Ridge: Unfitted regressor.
+        XGBRegressor: Unfitted XGBoost regressor.
     """
-    return Ridge(
-        alpha=model_params.get("alpha", 1.0),
-        random_state=model_params.get("random_state", 42),
+    return XGBRegressor(
+        n_estimators     = model_params.get("n_estimators", 200),
+        max_depth        = model_params.get("max_depth", 5),
+        learning_rate    = model_params.get("learning_rate", 0.05),
+        subsample        = model_params.get("subsample", 0.8),
+        colsample_bytree = model_params.get("colsample_bytree", 0.8),
+        objective        = "reg:squarederror",
+        random_state     = model_params.get("random_state", 42),
+        n_jobs           = -1,
     )
 
 
@@ -77,173 +64,244 @@ def get_ltv_model(model_params: dict):
 def train_churn_pipeline(
     X_train,
     y_train,
+    X_val=None,
+    y_val=None,
     categorical_cols: list = None,
     numerical_cols: list = None,
-    model_type: str = None,
-) -> Pipeline:
+) -> dict:
     """
-    Builds, fits, and returns a full sklearn Pipeline for churn classification.
+    Preprocesses features and fits an XGBoost churn classifier.
 
-    The pipeline contains:
-        1. A ColumnTransformer preprocessor (imputation + scaling + OHE).
-        2. A churn classifier (RandomForest or LogisticRegression).
+    Returns a dict containing the fitted model, preprocessing stats, and
+    the ordered feature column list — everything needed for consistent
+    inference later.
 
     Parameters:
-        X_train: Training features (pd.DataFrame).
+        X_train: Training features (pd.DataFrame, raw — before encoding).
         y_train: Binary churn labels (pd.Series, dtype int).
+        X_val:   Optional validation features for early stopping.
+        y_val:   Optional validation labels.
         categorical_cols (list, optional): Overrides config categorical features.
-        numerical_cols (list, optional): Overrides config numerical features.
-        model_type (str, optional): Overrides config model type.
+        numerical_cols   (list, optional): Overrides config numerical features.
 
     Returns:
-        Pipeline: Fitted sklearn pipeline ready for prediction.
+        dict: {
+            'model': XGBClassifier (fitted),
+            'fit_stats': dict of scaling stats,
+            'feature_columns': list of column names in training order,
+        }
     """
     logger.info("Initialising churn training pipeline...")
 
     churn_cfg = config["model"]["churn"]
-    if model_type is None:
-        model_type = churn_cfg.get("model_type", "random_forest")
-
     model_params = {
         "n_estimators": churn_cfg.get("n_estimators", 100),
-        "max_depth": churn_cfg.get("max_depth", 6),
+        "max_depth":    churn_cfg.get("max_depth", 6),
         "random_state": churn_cfg.get("random_state", 42),
     }
 
-    preprocessor = get_preprocessor_pipeline(
+    # ── Preprocess ────────────────────────────────────────────────────────────
+    X_enc, fit_stats, feature_columns = preprocess_dataframe(
+        X_train,
         categorical_cols=categorical_cols,
         numerical_cols=numerical_cols,
     )
-    classifier = get_churn_model(model_type, model_params)
 
-    pipeline = Pipeline(steps=[
-        ("preprocessor", preprocessor),
-        ("classifier", classifier),
-    ])
+    eval_set = None
+    if X_val is not None and y_val is not None:
+        X_val_enc, _, _ = preprocess_dataframe(
+            X_val,
+            categorical_cols=categorical_cols,
+            numerical_cols=numerical_cols,
+            reference_columns=feature_columns,
+            fit_stats=fit_stats,
+        )
+        eval_set = [(X_val_enc, y_val)]
 
+    # ── Fit ───────────────────────────────────────────────────────────────────
+    model = get_churn_model(model_params)
     logger.info(
-        f"Fitting churn pipeline — model: {model_type}, "
-        f"samples: {len(X_train):,}."
+        f"Fitting XGBoost churn classifier — "
+        f"n_estimators: {model_params['n_estimators']}, "
+        f"samples: {len(X_enc):,}."
     )
-    pipeline.fit(X_train, y_train)
+    model.fit(X_enc, y_train, eval_set=eval_set, verbose=False)
     logger.info("Churn model training completed successfully.")
-    return pipeline
+
+    return {
+        "model": model,
+        "fit_stats": fit_stats,
+        "feature_columns": feature_columns,
+    }
 
 
 def train_ltv_pipeline(
     X_train,
     y_train,
+    X_val=None,
+    y_val=None,
     categorical_cols: list = None,
     numerical_cols: list = None,
-) -> Pipeline:
+) -> dict:
     """
-    Builds, fits, and returns a full sklearn Pipeline for LTV regression.
+    Preprocesses features and fits an XGBoost LTV regressor.
 
-    The LTV target is TotalCharges, which must be excluded from X_train
+    The LTV target is TotalCharges — it must be excluded from X_train
     before calling this function.
 
     Parameters:
         X_train: Training features (pd.DataFrame, TotalCharges excluded).
         y_train: Continuous LTV target (pd.Series).
+        X_val:   Optional validation features.
+        y_val:   Optional validation target.
         categorical_cols (list, optional): Overrides config categorical features.
-        numerical_cols (list, optional): Overrides config numerical features.
+        numerical_cols   (list, optional): Overrides config numerical features.
 
     Returns:
-        Pipeline: Fitted sklearn pipeline ready for prediction.
+        dict: {
+            'model': XGBRegressor (fitted),
+            'fit_stats': dict of scaling stats,
+            'feature_columns': list of column names in training order,
+        }
     """
     logger.info("Initialising LTV training pipeline...")
 
     ltv_cfg = config["model"]["ltv"]
     model_params = {
-        "alpha": ltv_cfg.get("alpha", 1.0),
         "random_state": ltv_cfg.get("random_state", 42),
     }
 
-    preprocessor = get_preprocessor_pipeline(
+    X_enc, fit_stats, feature_columns = preprocess_dataframe(
+        X_train,
         categorical_cols=categorical_cols,
         numerical_cols=numerical_cols,
     )
-    regressor = get_ltv_model(model_params)
 
-    pipeline = Pipeline(steps=[
-        ("preprocessor", preprocessor),
-        ("regressor", regressor),
-    ])
+    eval_set = None
+    if X_val is not None and y_val is not None:
+        X_val_enc, _, _ = preprocess_dataframe(
+            X_val,
+            categorical_cols=categorical_cols,
+            numerical_cols=numerical_cols,
+            reference_columns=feature_columns,
+            fit_stats=fit_stats,
+        )
+        eval_set = [(X_val_enc, y_val)]
 
-    logger.info(f"Fitting LTV pipeline — samples: {len(X_train):,}.")
-    pipeline.fit(X_train, y_train)
+    model = get_ltv_model(model_params)
+    logger.info(f"Fitting XGBoost LTV regressor — samples: {len(X_enc):,}.")
+    model.fit(X_enc, y_train, eval_set=eval_set, verbose=False)
     logger.info("LTV model training completed successfully.")
-    return pipeline
+
+    return {
+        "model": model,
+        "fit_stats": fit_stats,
+        "feature_columns": feature_columns,
+    }
 
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
-def evaluate_churn_model(pipeline: Pipeline, X_test, y_test) -> dict:
+def evaluate_churn_model(model, X_test, y_test) -> dict:
     """
-    Evaluates a fitted churn pipeline and returns a metrics dictionary.
+    Evaluates a fitted XGBoost churn model and returns a metrics dictionary.
 
-    Metrics computed:
+    Metrics computed entirely with numpy (no sklearn dependency):
         - accuracy
-        - roc_auc
-        - classification_report (string)
+        - roc_auc  (trapezoidal approximation)
         - confusion_matrix (list of lists)
 
     Parameters:
-        pipeline (Pipeline): Fitted churn sklearn pipeline.
-        X_test: Test features.
-        y_test: True binary labels.
+        model:   Fitted XGBClassifier.
+        X_test:  Pre-processed test features (pd.DataFrame).
+        y_test:  True binary labels (pd.Series or np.ndarray).
 
     Returns:
         dict: Evaluation metrics.
     """
+    import numpy as np
+
     logger.info("Evaluating churn model performance...")
 
-    y_pred = pipeline.predict(X_test)
-    y_prob = pipeline.predict_proba(X_test)[:, 1]
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+    y_true = y_test.values if hasattr(y_test, "values") else y_test
+
+    # Accuracy
+    accuracy = float((y_pred == y_true).mean())
+
+    # ROC-AUC (trapezoidal)
+    thresholds = sorted(set(y_prob), reverse=True)
+    pos = int(y_true.sum()); neg = len(y_true) - pos
+    tpr_pts, fpr_pts = [0.0], [0.0]
+    for t in thresholds:
+        pred = (y_prob >= t).astype(int)
+        tp = int(((pred == 1) & (y_true == 1)).sum())
+        fp = int(((pred == 1) & (y_true == 0)).sum())
+        tpr_pts.append(tp / pos if pos > 0 else 0)
+        fpr_pts.append(fp / neg if neg > 0 else 0)
+    tpr_pts.append(1.0); fpr_pts.append(1.0)
+    roc_auc = float(np.trapezoid(tpr_pts, fpr_pts))
+
+    # Confusion matrix
+    cm = [[0, 0], [0, 0]]
+    for t, p in zip(y_true.tolist(), y_pred.tolist()):
+        cm[int(t)][int(p)] += 1
 
     metrics = {
-        "accuracy": round(accuracy_score(y_test, y_pred), 4),
-        "roc_auc": round(roc_auc_score(y_test, y_prob), 4),
-        "classification_report": classification_report(y_test, y_pred),
-        "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
+        "accuracy": round(accuracy, 4),
+        "roc_auc":  round(roc_auc, 4),
+        "confusion_matrix": cm,
     }
 
     logger.info(
         f"Churn model — Accuracy: {metrics['accuracy']}, ROC-AUC: {metrics['roc_auc']}"
     )
-    logger.info(f"\n{metrics['classification_report']}")
     return metrics
 
 
 # ── Persistence ────────────────────────────────────────────────────────────────
 
 def save_model_artifact(
-    pipeline: Pipeline,
-    artifact_name: str = "churn_model.joblib",
+    artifact: dict,
+    artifact_name: str = "churn_model.json",
     output_dir: str = "models/",
 ) -> str:
     """
-    Serialises a fitted pipeline to disk using joblib.
+    Saves the XGBoost model and its preprocessing metadata to disk.
+
+    The XGBoost model is saved in native JSON format via .save_model().
+    Preprocessing stats (fit_stats + feature_columns) are saved alongside
+    as a joblib file so inference can replicate the exact same transformation.
 
     Parameters:
-        pipeline (Pipeline): Fitted sklearn pipeline to save.
-        artifact_name (str): Output filename (e.g. 'churn_model.joblib').
-        output_dir (str): Directory path (relative to project root or absolute).
+        artifact (dict): Output of train_churn_pipeline() or train_ltv_pipeline().
+            Must contain keys: 'model', 'fit_stats', 'feature_columns'.
+        artifact_name (str): Base filename e.g. 'churn_model.json'.
+        output_dir (str): Directory (relative to project root or absolute).
 
     Returns:
-        str: Absolute path of the saved artifact.
+        str: Absolute path of the saved XGBoost model JSON.
     """
-    # Resolve output directory relative to project root
     if not os.path.isabs(output_dir):
         output_dir = os.path.join(PROJECT_ROOT, output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
-    os.makedirs(output_dir, exist_ok=True)   # exist_ok removes the need for a prior exists() check
+    model_path = os.path.join(output_dir, artifact_name)
+    meta_name  = artifact_name.replace(".json", "_meta.joblib")
+    meta_path  = os.path.join(output_dir, meta_name)
 
-    artifact_path = os.path.join(output_dir, artifact_name)
-    logger.info(f"Saving pipeline artifact to: {artifact_path}")
-    joblib.dump(pipeline, artifact_path)
-    logger.info("Artifact saved successfully.")
-    return artifact_path
+    logger.info(f"Saving XGBoost model to: {model_path}")
+    artifact["model"].save_model(model_path)
+
+    meta = {
+        "fit_stats":       artifact["fit_stats"],
+        "feature_columns": artifact["feature_columns"],
+    }
+    joblib.dump(meta, meta_path)
+    logger.info(f"Preprocessing metadata saved to: {meta_path}")
+
+    return model_path
 
 
 if __name__ == "__main__":

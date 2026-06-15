@@ -1,13 +1,15 @@
 """
-test_modules.py  -  ASCII-safe smoke test for all src/ modules
+test_modules.py  -  Smoke test for all src/ modules (XGBoost edition)
 Run from the project root:  python test_modules.py
 """
 import sys
 import os
 import traceback
 import pandas as pd
+import numpy as np
 
 results = []
+
 
 def check(label, fn):
     try:
@@ -50,24 +52,39 @@ print("\n" + "="*60)
 print("  3 - preprocessing")
 print("="*60)
 
-from src.preprocessing import clean_data, get_preprocessor_pipeline, split_dataset
+from src.preprocessing import clean_data, preprocess_dataframe, split_dataset
 
 df_clean = None
 if df_raw is not None:
     df_clean = check("clean_data() returns DataFrame",         lambda: clean_data(df_raw))
     if df_clean is not None:
         check("Churn column is binary int {0,1}",
-              lambda: True if set(df_clean["Churn"].dropna().unique()).issubset({0,1})
+              lambda: True if set(df_clean["Churn"].dropna().unique()).issubset({0, 1})
               else (_ for _ in ()).throw(AssertionError(str(df_clean["Churn"].unique()))))
         check("TotalCharges is numeric dtype",
               lambda: True if pd.api.types.is_numeric_dtype(df_clean["TotalCharges"])
               else (_ for _ in ()).throw(AssertionError("Not numeric")))
 
-check("get_preprocessor_pipeline() builds ColumnTransformer", lambda: get_preprocessor_pipeline())
+# Test preprocess_dataframe
+if df_clean is not None:
+    X_sample = df_clean.drop(columns=["customerID", "Churn"], errors="ignore").head(20)
+    pp_result = check("preprocess_dataframe() returns (df, stats, cols) tuple",
+                      lambda: preprocess_dataframe(X_sample))
+    if pp_result is not None:
+        df_enc, fit_stats, feat_cols = pp_result
+        check("Encoded DataFrame has more columns than input (OHE applied)",
+              lambda: True if df_enc.shape[1] > X_sample.shape[1]
+              else (_ for _ in ()).throw(AssertionError(f"{df_enc.shape[1]} vs {X_sample.shape[1]}")))
+        check("fit_stats is a dict with numeric-col entries",
+              lambda: True if isinstance(fit_stats, dict) and len(fit_stats) > 0
+              else (_ for _ in ()).throw(AssertionError(str(fit_stats))))
+        check("feature_columns is a non-empty list",
+              lambda: True if isinstance(feat_cols, list) and len(feat_cols) > 0
+              else (_ for _ in ()).throw(AssertionError(str(feat_cols))))
 
 splits = None
 if df_clean is not None:
-    splits = check("split_dataset() returns 4-tuple with stratification",
+    splits = check("split_dataset() returns 4-tuple",
                    lambda: split_dataset(df_clean))
     if splits is not None:
         Xt, Xv, yt, yv = splits
@@ -106,7 +123,7 @@ if df_clean is not None:
 
 # ---------------------------------------------------------------------------
 print("\n" + "="*60)
-print("  5 - train")
+print("  5 - train  (XGBoost)")
 print("="*60)
 
 from src.train import (
@@ -114,55 +131,68 @@ from src.train import (
     evaluate_churn_model, save_model_artifact,
 )
 
-churn_pipeline = None
-ltv_pipeline   = None
+churn_artifact = None
+ltv_artifact   = None
 saved_path     = None
 
 if df_feat is not None and splits is not None:
-    # Re-split on feature-engineered df
     X_tr, X_te, y_tr, y_te = split_dataset(df_feat)
 
-    churn_pipeline = check("train_churn_pipeline() fits without error",
+    # ── Churn model ────────────────────────────────────────────────────────
+    churn_artifact = check("train_churn_pipeline() returns dict with model/fit_stats/feature_columns",
                            lambda: train_churn_pipeline(X_tr, y_tr))
-    if churn_pipeline is not None:
-        check("Pipeline steps: ['preprocessor', 'classifier']",
-              lambda: True if list(churn_pipeline.named_steps.keys()) == ["preprocessor", "classifier"]
-              else (_ for _ in ()).throw(AssertionError(str(list(churn_pipeline.named_steps.keys())))))
+    if churn_artifact is not None:
+        check("artifact['model'] is XGBClassifier",
+              lambda: True if hasattr(churn_artifact["model"], "predict_proba")
+              else (_ for _ in ()).throw(AssertionError("Missing predict_proba")))
+        check("artifact['fit_stats'] is a non-empty dict",
+              lambda: True if isinstance(churn_artifact["fit_stats"], dict) and len(churn_artifact["fit_stats"]) > 0
+              else (_ for _ in ()).throw(AssertionError(str(churn_artifact.get("fit_stats")))))
+        check("artifact['feature_columns'] is a non-empty list",
+              lambda: True if isinstance(churn_artifact["feature_columns"], list) and len(churn_artifact["feature_columns"]) > 0
+              else (_ for _ in ()).throw(AssertionError(str(churn_artifact.get("feature_columns")))))
 
-        metrics = check("evaluate_churn_model() returns real metrics dict",
-                        lambda: evaluate_churn_model(churn_pipeline, X_te, y_te))
+        # Preprocess test set with the same fit_stats + feature_columns
+        from src.preprocessing import preprocess_dataframe as ppdf
+        X_te_enc, _, _ = ppdf(
+            X_te,
+            reference_columns=churn_artifact["feature_columns"],
+            fit_stats=churn_artifact["fit_stats"],
+        )
+
+        metrics = check("evaluate_churn_model() returns metrics dict",
+                        lambda: evaluate_churn_model(churn_artifact["model"], X_te_enc, y_te))
         if metrics:
             check("Accuracy > 0.5  (got " + str(metrics.get("accuracy")) + ")",
                   lambda: True if metrics["accuracy"] > 0.5 else (_ for _ in ()).throw(AssertionError(str(metrics["accuracy"]))))
             check("ROC-AUC > 0.5  (got " + str(metrics.get("roc_auc")) + ")",
                   lambda: True if metrics["roc_auc"] > 0.5 else (_ for _ in ()).throw(AssertionError(str(metrics["roc_auc"]))))
-            check("classification_report is a string",
-                  lambda: True if isinstance(metrics.get("classification_report"), str) else (_ for _ in ()).throw(AssertionError()))
             check("confusion_matrix is list-of-lists",
                   lambda: True if isinstance(metrics.get("confusion_matrix"), list) else (_ for _ in ()).throw(AssertionError()))
 
-    # LTV pipeline (numeric cols only: tenure + MonthlyCharges + total_services)
-    ltv_num = ["tenure", "MonthlyCharges", "total_services"]
-    ltv_cat = [c for c in X_tr.columns if c not in ltv_num]
+    # ── LTV model ──────────────────────────────────────────────────────────
     y_ltv_tr = df_feat.loc[X_tr.index, "TotalCharges"]
-    ltv_pipeline = check("train_ltv_pipeline() fits without error",
-                         lambda: train_ltv_pipeline(X_tr, y_ltv_tr,
-                                                     categorical_cols=ltv_cat,
-                                                     numerical_cols=ltv_num))
-    if ltv_pipeline is not None:
-        check("LTV pipeline steps: ['preprocessor', 'regressor']",
-              lambda: True if list(ltv_pipeline.named_steps.keys()) == ["preprocessor", "regressor"]
-              else (_ for _ in ()).throw(AssertionError(str(list(ltv_pipeline.named_steps.keys())))))
+    ltv_artifact = check("train_ltv_pipeline() returns dict with model",
+                         lambda: train_ltv_pipeline(X_tr, y_ltv_tr))
+    if ltv_artifact is not None:
+        check("LTV artifact['model'] has predict() method",
+              lambda: True if hasattr(ltv_artifact["model"], "predict")
+              else (_ for _ in ()).throw(AssertionError("Missing predict")))
 
-    if churn_pipeline is not None:
-        saved_path = check("save_model_artifact() saves churn pipeline",
-                           lambda: save_model_artifact(churn_pipeline, "churn_model_test.joblib", "models/"))
+    # ── Save ───────────────────────────────────────────────────────────────
+    if churn_artifact is not None:
+        saved_path = check("save_model_artifact() saves churn_model_test.json",
+                           lambda: save_model_artifact(churn_artifact, "churn_model_test.json", "models/"))
         if saved_path:
-            check("Saved file exists on disk", lambda: True if os.path.exists(saved_path) else (_ for _ in ()).throw(AssertionError(saved_path)))
+            check("Saved .json file exists on disk",
+                  lambda: True if os.path.exists(saved_path) else (_ for _ in ()).throw(AssertionError(saved_path)))
+            meta_path = saved_path.replace(".json", "_meta.joblib")
+            check("Preprocessing metadata .joblib saved alongside model",
+                  lambda: True if os.path.exists(meta_path) else (_ for _ in ()).throw(AssertionError(meta_path)))
 
 # ---------------------------------------------------------------------------
 print("\n" + "="*60)
-print("  6 - predict  (ChurnLTVInferencePipeline)")
+print("  6 - predict  (ChurnLTVInferencePipeline — XGBoost)")
 print("="*60)
 
 from src.predict import ChurnLTVInferencePipeline
@@ -170,10 +200,14 @@ from src.predict import ChurnLTVInferencePipeline
 infer = check("ChurnLTVInferencePipeline() instantiates", lambda: ChurnLTVInferencePipeline("models/"))
 
 if infer is not None and saved_path is not None:
-    infer.model_path = saved_path   # point at test artifact
+    # Point at test artifact
+    meta_path = saved_path.replace(".json", "_meta.joblib")
+    infer.model_path = saved_path
+    infer.meta_path  = meta_path
 
-    check("load_artifacts() succeeds", lambda: infer.load_artifacts() or True)
-    check("self.pipeline is not None after load", lambda: True if infer.pipeline is not None else (_ for _ in ()).throw(AssertionError("pipeline is None")))
+    check("load_artifacts() succeeds",              lambda: infer.load_artifacts() or True)
+    check("self.model is not None after load",       lambda: True if infer.model is not None else (_ for _ in ()).throw(AssertionError("model is None")))
+    check("self.feature_columns is a list",         lambda: True if isinstance(infer.feature_columns, list) and len(infer.feature_columns) > 0 else (_ for _ in ()).throw(AssertionError("feature_columns empty")))
 
     sample = {
         "customerID": "0000-TEST",
@@ -202,15 +236,17 @@ if infer is not None and saved_path is not None:
     res2 = check("predict_churn(DataFrame, 2 rows) returns 2 results",
                  lambda: infer.predict_churn(batch))
     if res2:
-        check("Batch result length == 2", lambda: True if len(res2) == 2 else (_ for _ in ()).throw(AssertionError(str(len(res2)))))
+        check("Batch result length == 2",
+              lambda: True if len(res2) == 2 else (_ for _ in ()).throw(AssertionError(str(len(res2)))))
 
-    # Non-zero-based index test (the original critical bug)
+    # Non-zero-based index test
     batch_reindexed = batch.copy()
     batch_reindexed.index = [100, 200]
-    res3 = check("predict_churn() correct with non-zero-based index (index mismatch bug test)",
+    res3 = check("predict_churn() correct with non-zero-based index",
                  lambda: infer.predict_churn(batch_reindexed))
     if res3:
-        check("Non-zero-index result length == 2", lambda: True if len(res3) == 2 else (_ for _ in ()).throw(AssertionError(str(len(res3)))))
+        check("Non-zero-index result length == 2",
+              lambda: True if len(res3) == 2 else (_ for _ in ()).throw(AssertionError(str(len(res3)))))
 
     # TypeError guard
     def _type_error_test():
