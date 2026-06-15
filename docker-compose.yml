@@ -2,14 +2,39 @@
 # Customer Churn & LTV Prediction Engine
 #
 # Usage:
-#   docker-compose up --build          # start both API + dashboard
+#   docker-compose up --build          # start all services (postgres + API + dashboard)
+#   docker-compose up postgres         # start only PostgreSQL
 #   docker-compose up api              # start only FastAPI
 #   docker-compose up dashboard        # start only Streamlit
-#   docker-compose down                # stop all services
+#   docker-compose down -v             # stop all services and remove volumes
 
 version: "3.9"
 
 services:
+
+  # ── PostgreSQL Database ─────────────────────────────────────────────────────
+  # Week 1 requirement: Setup PostgreSQL database and load the Telco dataset.
+  # After startup, run: docker-compose exec postgres psql -U churn_user -d churn_db
+  # To ingest data: docker-compose exec api python scripts/load_to_postgres.py
+  postgres:
+    image: postgres:15-alpine
+    container_name: churn-postgres
+    environment:
+      POSTGRES_DB:       churn_db
+      POSTGRES_USER:     churn_user
+      POSTGRES_PASSWORD: churn_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U churn_user -d churn_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
 
   # ── FastAPI Inference Service ───────────────────────────────────────────────
   api:
@@ -21,18 +46,25 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Mount models + data so you can update them without rebuilding
       - ./models:/app/models
       - ./data:/app/data
       - ./reports:/app/reports
     environment:
       - PYTHONUNBUFFERED=1
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=churn_db
+      - DB_USER=churn_user
+      - DB_PASSWORD=churn_pass
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     restart: unless-stopped
 
   # ── Streamlit Dashboard ─────────────────────────────────────────────────────
@@ -55,7 +87,16 @@ services:
       - ./reports:/app/reports
     environment:
       - PYTHONUNBUFFERED=1
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=churn_db
+      - DB_USER=churn_user
+      - DB_PASSWORD=churn_pass
     depends_on:
       api:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local

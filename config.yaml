@@ -53,3 +53,15 @@ logging:
   level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   log_file: "reports/engine.log"
+
+# PostgreSQL database connection
+# Week 1 requirement: Setup PostgreSQL database and load the Telco dataset.
+# Override any of these via environment variables (DB_HOST, DB_PORT, etc.)
+database:
+  host:     "localhost"
+  port:     5432
+  name:     "churn_db"
+  user:     "churn_user"
+  password: "churn_pass"
+  table_customers:  "customers"
+  table_predictions: "predictions"
