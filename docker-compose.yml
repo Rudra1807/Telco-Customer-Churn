@@ -1,12 +1,20 @@
 # docker-compose.yml
 # Customer Churn & LTV Prediction Engine
 #
-# Usage:
-#   docker-compose up --build          # start all services (postgres + API + dashboard)
-#   docker-compose up postgres         # start only PostgreSQL
-#   docker-compose up api              # start only FastAPI
-#   docker-compose up dashboard        # start only Streamlit
-#   docker-compose down -v             # stop all services and remove volumes
+# Services:
+#   postgres   → PostgreSQL 15       : http://localhost:5432  (churn_db / churn_user / churn_pass)
+#   api        → FastAPI inference   : http://localhost:8000  (REST API + /docs)
+#   metabase   → Metabase BI        : http://localhost:3000  (PRIMARY dashboard — spec requirement)
+#   dashboard  → Streamlit (dev)    : http://localhost:8501  (supplementary developer view)
+#
+# Quick start:
+#   docker-compose up --build                        # start everything
+#   docker-compose exec api python scripts/load_to_postgres.py  # load Telco data into DB
+#   Open http://localhost:3000 to set up Metabase
+#
+# Stop:
+#   docker-compose down -v   (removes volumes)
+#   docker-compose down      (keeps volumes / data)
 
 version: "3.9"
 
@@ -67,7 +75,9 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  # ── Streamlit Dashboard ─────────────────────────────────────────────────────
+  # ── Streamlit Dashboard (supplementary developer view) ─────────────────────
+  # The spec primary dashboard is Metabase (above, port 3000).
+  # Streamlit is kept as a lightweight dev/demo view.
   dashboard:
     build:
       context: .
@@ -97,6 +107,43 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Metabase BI Dashboard ────────────────────────────────────────────────────
+  # Week 4 requirement: Connect BI tool to database and API, build interactive
+  # dashboards showing global churn risk and segmenting users by LTV.
+  #
+  # First-run setup (one time only):
+  #   1. Open http://localhost:3000
+  #   2. Create admin account
+  #   3. Add Database → PostgreSQL:
+  #        Host: postgres  |  Port: 5432  |  Database: churn_db
+  #        User: churn_user  |  Password: churn_pass
+  #   4. Browse tables: customers, predictions, v_churn_by_contract, v_ltv_segments
+  #   5. Build dashboards using Metabase's no-code question builder
+  metabase:
+    image: metabase/metabase:latest
+    container_name: churn-metabase
+    ports:
+      - "3000:3000"
+    volumes:
+      - metabase_data:/metabase-data
+    environment:
+      MB_DB_TYPE:               h2
+      MB_DB_FILE:               /metabase-data/metabase.db
+      JAVA_TIMEZONE:            Asia/Kolkata
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
 volumes:
   postgres_data:
     driver: local
+  metabase_data:
+    driver: local
+

@@ -110,15 +110,13 @@ customer-churn-ltv-engine/
   - `GET  /model/info` — loaded model metadata
 
 ### Week 4 — Visualization & Deployment
-- `dashboard/app.py` — **Streamlit** interactive dashboard:
-  - Global churn risk overview
-  - LTV segmentation (HIGH / MEDIUM / LOW risk tiers)
-  - Customer-level drill-down
-  > **Note:** The specification listed Apache Superset/Metabase as the BI layer.
-  > Streamlit was used instead to keep the entire stack self-contained and avoid
-  > requiring a separate Superset service. For production, the `predictions` table
-  > in PostgreSQL is fully compatible with Superset or Metabase via the exposed port 5432.
-- `Dockerfile` + `docker-compose.yml` — containerises all three services (postgres, api, dashboard).
+- **Metabase** (port `3000`) — **Primary BI dashboard** (spec requirement):
+  - Connects directly to PostgreSQL `churn_db`
+  - No-code question builder for creating charts and dashboards
+  - Pre-built views available: `v_churn_by_contract`, `v_ltv_segments`
+  - Every `/predict` API call is automatically logged to the `predictions` table → Metabase shows live data
+- **Streamlit** (port `8501`) — Supplementary developer view (kept for rapid prototyping)
+- `Dockerfile` + `docker-compose.yml` — containerises all **four** services: `postgres`, `api`, `metabase`, `dashboard`
 
 ---
 
@@ -130,16 +128,17 @@ customer-churn-ltv-engine/
 # 1. Add your Telco CSV
 cp /path/to/WA_Fn-UseC_-Telco-Customer-Churn.csv data/raw/
 
-# 2. Start all services (PostgreSQL + FastAPI + Streamlit)
+# 2. Start all services (PostgreSQL + FastAPI + Metabase + Streamlit)
 docker-compose up --build
 
-# 3. Load the dataset into PostgreSQL
+# 3. Load the dataset into PostgreSQL (run after postgres is healthy)
 docker-compose exec api python scripts/load_to_postgres.py
 
-# 4. Open the dashboard
-#    Streamlit:  http://localhost:8501
-#    FastAPI:    http://localhost:8000/docs
-#    PostgreSQL: localhost:5432 (churn_user / churn_pass / churn_db)
+# 4. Open services:
+#    Metabase (PRIMARY dashboard):  http://localhost:3000
+#    FastAPI docs:                  http://localhost:8000/docs
+#    Streamlit (dev view):          http://localhost:8501
+#    PostgreSQL:                    localhost:5432  (churn_user/churn_pass/churn_db)
 ```
 
 ### Option B — Local (Virtual Environment)
@@ -168,6 +167,46 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 # 6. Start the dashboard (separate terminal)
 streamlit run dashboard/app.py
 ```
+
+---
+
+## Metabase Setup Guide (First-Run, One-Time)
+
+After `docker-compose up --build`, wait ~60 seconds for Metabase to initialise, then:
+
+1. **Open** → `http://localhost:3000`
+2. **Create admin account** — set your name, email, and password
+3. **Add your database:**
+   - Click **"Add your data"** → Select **PostgreSQL**
+   - Fill in:
+     | Field | Value |
+     |---|---|
+     | Display name | `Churn DB` |
+     | Host | `postgres` |
+     | Port | `5432` |
+     | Database name | `churn_db` |
+     | Username | `churn_user` |
+     | Password | `churn_pass` |
+   - Click **"Save"**
+
+4. **Build dashboards** — Metabase auto-discovers all tables and views:
+
+| Table / View | What to build |
+|---|---|
+| `customers` | Churn rate by contract type, tenure distribution, revenue analysis |
+| `predictions` | Live churn risk feed, LTV prediction log |
+| `v_churn_by_contract` | Pre-aggregated: churn rate % per contract type |
+| `v_ltv_segments` | Pre-aggregated: avg LTV per risk tier (HIGH/MEDIUM/LOW) |
+
+5. **Suggested dashboards to create:**
+   - 📊 **Global Churn Risk** — pie chart from `v_churn_by_contract`, gauge for overall churn rate
+   - 💰 **LTV Segmentation** — bar chart from `v_ltv_segments`, scatter of LTV vs tenure
+   - 🔴 **High Risk Customers** — filtered table from `predictions` where `churn_risk_tier = 'HIGH'`
+   - 📈 **Prediction Activity** — time-series of `predictions.predicted_at` (API usage tracking)
+
+> **Note on Streamlit:** The `dashboard/app.py` Streamlit app is retained as a lightweight
+> developer view for rapid prototyping. For the production/presentation BI layer,
+> Metabase is the correct tool per the project specification.
 
 ---
 

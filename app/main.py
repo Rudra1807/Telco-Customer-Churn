@@ -8,6 +8,11 @@ Endpoints:
     POST /predict/batch       — batch scoring (CSV upload or JSON list)
     GET  /model/info          — model metadata
 
+Prediction Logging:
+    Every /predict call writes results to the PostgreSQL `predictions` table
+    so Metabase dashboards (http://localhost:3000) stay live and up-to-date.
+    DB logging is non-blocking — if PostgreSQL is unavailable the API still works.
+
 Run from project root:
     uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 """
@@ -50,6 +55,80 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 CHURN_MODEL_PATH = os.path.join(MODELS_DIR, "churn_model.json")
 CHURN_META_PATH  = os.path.join(MODELS_DIR, "churn_model_meta.joblib")
 LTV_MODEL_PATH   = os.path.join(MODELS_DIR, "ltv_model.json")
+
+# ---------------------------------------------------------------------------
+# PostgreSQL connection settings (from environment or defaults)
+# Used to log every prediction → predictions table → Metabase dashboards
+# ---------------------------------------------------------------------------
+DB_HOST     = os.getenv("DB_HOST",     "localhost")
+DB_PORT     = int(os.getenv("DB_PORT", "5432"))
+DB_NAME     = os.getenv("DB_NAME",     "churn_db")
+DB_USER     = os.getenv("DB_USER",     "churn_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "churn_pass")
+MODEL_VERSION = "2.0.0"
+
+
+def _log_predictions_to_db(results: list[dict]) -> None:
+    """
+    Write prediction results to the PostgreSQL `predictions` table.
+
+    This enables the Metabase BI dashboard (Week 4 requirement) to display
+    live churn risk and LTV segmentation data.
+
+    Non-blocking: any DB error is logged as a warning and silently swallowed
+    so the API response is never delayed or broken by DB unavailability.
+
+    Parameters:
+        results (list[dict]): List of prediction result dicts from _score_dataframe().
+            Each dict must contain: customerID, churn_probability, churn_prediction,
+            churn_risk_tier, ltv_prediction.
+    """
+    try:
+        import psycopg2
+        from psycopg2.extras import execute_values
+    except ImportError:
+        logger.warning("psycopg2 not installed — skipping prediction logging to DB.")
+        return
+
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+            user=DB_USER, password=DB_PASSWORD,
+            connect_timeout=2,          # fail fast if DB is not reachable
+        )
+        cur = conn.cursor()
+
+        rows = [
+            (
+                r.get("customerID"),
+                r.get("churn_probability"),
+                r.get("churn_prediction"),
+                r.get("churn_risk_tier"),
+                r.get("ltv_prediction"),
+                MODEL_VERSION,
+            )
+            for r in results
+        ]
+
+        execute_values(
+            cur,
+            """
+            INSERT INTO predictions
+                (customer_id, churn_probability, churn_prediction,
+                 churn_risk_tier, ltv_prediction, model_version)
+            VALUES %s;
+            """,
+            rows,
+            page_size=500,
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Logged %d prediction(s) to PostgreSQL.", len(rows))
+
+    except Exception as exc:  # noqa: BLE001
+        # Non-fatal: API still returns results even if DB is down
+        logger.warning("Could not log predictions to DB (non-fatal): %s", exc)
 
 # ---------------------------------------------------------------------------
 # Model state (loaded once at startup)
@@ -210,6 +289,10 @@ def _score_dataframe(df_raw: pd.DataFrame) -> list[dict]:
             "churn_risk_tier":   _risk_tier(churn_probs[i]),
             "ltv_prediction":    round(float(ltv_preds[i]), 2),
         })
+
+    # Log predictions to PostgreSQL → powers Metabase dashboards (non-blocking)
+    _log_predictions_to_db(results)
+
     return results
 
 
