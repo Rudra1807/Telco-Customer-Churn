@@ -26,6 +26,7 @@ models/*
 reports/*.log
 reports/*.png
 reports/*.html
+reports/*.csv
 reports/engine.log
 
 # IDE files

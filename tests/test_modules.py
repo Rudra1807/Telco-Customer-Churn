@@ -1,6 +1,6 @@
 """
 test_modules.py  -  Smoke test for all src/ modules (XGBoost edition)
-Run from the project root:  python test_modules.py
+Run from the project root:  python tests/test_modules.py
 """
 import sys
 import os

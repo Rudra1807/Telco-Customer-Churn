@@ -250,5 +250,5 @@ All parameters live in [`config.yaml`](config.yaml):
 ```bash
 pytest tests/ -v
 # or run the integration test module:
-python test_modules.py
+python tests/test_modules.py
 ```
